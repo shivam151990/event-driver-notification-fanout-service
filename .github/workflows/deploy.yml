@@ -29,7 +29,7 @@ jobs:
           java-version: '21'
           cache: maven
       - name: Verify before deployment
-        run: ./mvnw -B -ntp verify
+        run: sh ./mvnw -B -ntp verify
       - uses: digitalocean/action-doctl@v2
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}

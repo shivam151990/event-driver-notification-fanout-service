@@ -310,12 +310,14 @@ Integration tests use **real PostgreSQL and Kafka** in Testcontainers and a loca
 
 | Workflow | Trigger | What it verifies or deploys |
 |---|---|---|
-| [Build and test](.github/workflows/ci.yml) | Every push, pull request, or manual run | JDK 21, `./mvnw -B -ntp verify`, uploaded test/coverage reports, then a Docker image build |
+| [Build and test](.github/workflows/ci.yml) | Every push, pull request, or manual run | JDK 21, `sh ./mvnw -B -ntp verify`, uploaded test/coverage reports, then a Docker image build |
 | [Deploy to DigitalOcean](.github/workflows/deploy.yml) | Manual run on `main`, with an existing `app_id` | Reruns `verify`, then requests an App Platform rebuild/deployment and waits for completion |
 
 **CI runs in GitHub Actions, not in the DigitalOcean window.** Push the repository including `.github/workflows/ci.yml`, open **GitHub → Actions → Build and test**, and check the run for that commit. Testcontainers starts disposable PostgreSQL and Kafka on the GitHub runner; CI needs neither managed-cluster credentials nor a DigitalOcean token. Reports are attached as the `test-reports` artifact. The Postman collection and cloud guide are separate manual acceptance checks.
 
 To enable the deployment workflow, create the GitHub environment `production`, add its `DIGITALOCEAN_ACCESS_TOKEN` secret, and run **Deploy to DigitalOcean** with the App Platform app ID. Disable App Platform's automatic deploy-on-push when using this test-gated workflow; an independent automatic deployment does not wait for GitHub CI. The supplied app spec already disables it. See the [deployment workflow instructions](deploy/digitalocean/README.md#github-actions-ci-and-deployment).
+
+If a run exits immediately with `./mvnw: Permission denied` (exit code `126`), Maven and the tests have not started: the wrapper's executable permission is missing. Both workflows invoke it with `sh ./mvnw` so they also work after file uploads/exports that lose permissions. For direct local execution, run `chmod +x mvnw`; in a Git checkout, record the executable bit with `git update-index --chmod=+x mvnw`. Push the updated workflow files to trigger a new run; rerunning an old failed commit does not pick up the fix.
 
 The deployment workflow rebuilds the app's configured remote `main` branch; it does not promote the image built by CI. Avoid concurrent pushes during deployment. Promoting an immutable tested image digest is a future hardening step.
 
