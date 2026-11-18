@@ -1,0 +1,9 @@
+# DigitalOcean managed services. Activate only after setting all required secrets.
+spring:
+  kafka:
+    properties:
+      security.protocol: SASL_SSL
+      sasl.mechanism: SCRAM-SHA-256
+      ssl.truststore.type: PEM
+      ssl.truststore.certificates: ${KAFKA_CA_CERT}
+      ssl.endpoint.identification.algorithm: https

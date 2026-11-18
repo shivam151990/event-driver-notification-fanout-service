@@ -1,0 +1,631 @@
+openapi: 3.1.0
+info:
+  title: Event-Driven Notification Fanout API
+  version: 1.0.0
+  description: |
+    Durable event ingestion, immutable subscription rules, audited webhook delivery and replay.
+    The API key represents one trusted administrative principal; this API is not tenant-isolated.
+    Requests and responses use JSON. Request bodies are limited to 1 MiB by default, including
+    chunked bodies. Compressed bodies, duplicate object keys, unknown request properties and
+    trailing JSON tokens are rejected. JSON nesting is limited to 100 levels, numeric tokens
+    to 100 characters and strings to 1 MiB. Numbers must expand to at most 100 decimal characters.
+    U+0000 and unpaired Unicode surrogates are rejected before persistence.
+    Webhooks use HTTPS and public addresses by default.
+
+    Delivery is at-least-once within a bounded retry policy; exhausted or permanent failures
+    remain queryable as FAILED. Subscribers must deduplicate by deliveryId. Replays use new
+    deliveryId values. Original event IDs remain stable. See README.md for failure semantics.
+servers:
+  - url: http://localhost:8080
+    description: Local development; terminate TLS at the production ingress
+security:
+  - ApiKey: []
+tags:
+  - name: Events
+  - name: Subscriptions
+  - name: Deliveries
+  - name: Operations
+paths:
+  /api/v1/events:
+    post:
+      tags: [Events]
+      operationId: ingestEvent
+      summary: Durably accept an event and snapshot eligible subscriptions
+      description: |
+        Returns only after the event, subscription snapshot and outbox record commit together.
+        A same-key retry with equivalent JSON returns the existing event; a different request
+        for the same key returns 409. Object key order and numerically equivalent JSON numbers
+        do not change request identity. Without a key, each request creates a distinct event.
+        Acceptance does not mean webhook delivery has completed.
+      parameters:
+        - $ref: '#/components/parameters/OptionalIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventRequest'
+      responses:
+        '202':
+          description: Durable acceptance, including an idempotent repeat
+          headers:
+            Location:
+              schema: {type: string}
+              description: Relative URL of the accepted event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/events/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Events]
+      operationId: getEvent
+      summary: Retrieve an event and its fanout state
+      responses:
+        '200':
+          description: Event; fanoutCompleted indicates matching has finished, not delivery
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Event'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/subscriptions:
+    post:
+      tags: [Subscriptions]
+      operationId: createSubscription
+      summary: Register an immutable webhook subscription
+      description: |
+        Newly accepted events can match the subscription immediately after registration commits.
+        Webhook URL, signing secret, ordering flag and filter are immutable; replace a subscription
+        to change them. The signing secret is never returned by an API response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SubscriptionRequest'}
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location:
+              schema: {type: string}
+              description: Relative URL of the subscription
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Subscription'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    get:
+      tags: [Subscriptions]
+      operationId: listSubscriptions
+      summary: List active subscriptions in ascending sequence order
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterSequence'
+      responses:
+        '200':
+          description: Bare array; pass its last sequence as after to retrieve the next page
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Subscription'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/subscriptions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Subscriptions]
+      operationId: getSubscription
+      summary: Retrieve a subscription, including a deleted subscription's tombstone
+      responses:
+        '200':
+          description: Subscription without its signing secret
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Subscription'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    delete:
+      tags: [Subscriptions]
+      operationId: deleteSubscription
+      summary: Stop subscribing to subsequently accepted events
+      description: |
+        Soft deletion preserves audit history and the eligibility snapshots of earlier events.
+        Already accepted events and pending deliveries continue. Repeated deletion of the same
+        existing subscription succeeds. New replay requests for deleted subscriptions are rejected.
+      responses:
+        '204': {description: Deleted, or already deleted}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/subscriptions/{id}/replays:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Subscriptions]
+      operationId: replaySubscriptionEvents
+      summary: Queue a new delivery generation for a historical time range
+      description: |
+        Selects events by their acceptedAt timestamp in [from,to), restricted to the subscription's
+        original eligibility snapshots, then reapplies its immutable filter. The range is at most
+        31 days and at most 10,000 eligible events before filter evaluation. All replay deliveries
+        are committed atomically. Existing original deliveries are not modified. An idempotent
+        repeat returns the same replay record. Bounds are rounded upward to database microsecond
+        precision, preserving [from,to); a range with no representable microsecond is rejected.
+        Ordered subscriptions append a replay batch after work accepted before the replay, with
+        replayed events in original event order within each source.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReplayRequest'}
+      responses:
+        '202':
+          description: Replay deliveries committed, including an idempotent repeat
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Replay'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422':
+          description: More than 10,000 eligible events; reduce the time range
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/deliveries:
+    get:
+      tags: [Deliveries]
+      operationId: listDeliveries
+      summary: Query delivery history by event, subscription, both, or neither
+      parameters:
+        - name: eventId
+          in: query
+          schema: {type: string, format: uuid}
+        - name: subscriptionId
+          in: query
+          schema: {type: string, format: uuid}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterSequence'
+      responses:
+        '200':
+          description: Bare array in sequence order; pass the last sequence as after
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Delivery'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/deliveries/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Deliveries]
+      operationId: getDelivery
+      summary: Retrieve a delivery's current state
+      responses:
+        '200':
+          description: Current delivery state; in-flight and scheduled retries both remain PENDING
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Delivery'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/deliveries/{id}/attempts:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Deliveries]
+      operationId: listDeliveryAttempts
+      summary: Retrieve persisted attempt timestamps, HTTP status codes and outcomes
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - name: after
+          in: query
+          description: Exclusive attempt ID cursor; pass the last item's id for the next page
+          schema: {type: integer, format: int64, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: Bare array ordered by ascending attempt ID
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/DeliveryAttempt'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /actuator/health:
+    get:
+      tags: [Operations]
+      operationId: health
+      summary: Application health without component details
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+        '503':
+          description: Unhealthy
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+  /actuator/health/liveness:
+    get:
+      tags: [Operations]
+      operationId: liveness
+      summary: Process liveness probe
+      security: []
+      responses:
+        '200': {description: Alive}
+        '503': {description: Not live}
+  /actuator/health/readiness:
+    get:
+      tags: [Operations]
+      operationId: readiness
+      summary: Readiness probe including PostgreSQL availability
+      security: []
+      responses:
+        '200': {description: Ready}
+        '503': {description: Not ready}
+  /actuator/info:
+    get:
+      tags: [Operations]
+      operationId: info
+      summary: Public application information
+      security: []
+      responses:
+        '200':
+          description: Application information
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+  /actuator/prometheus:
+    get:
+      tags: [Operations]
+      operationId: prometheus
+      summary: Authenticated Prometheus metrics
+      responses:
+        '200':
+          description: Prometheus scrape output
+          content:
+            text/plain:
+              schema: {type: string}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /actuator/metrics:
+    get:
+      tags: [Operations]
+      operationId: metricNames
+      summary: Authenticated list of available metric names
+      responses:
+        '200':
+          description: Actuator metrics index
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  names:
+                    type: array
+                    items: {type: string}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /actuator/metrics/{name}:
+    get:
+      tags: [Operations]
+      operationId: metricDetails
+      summary: Authenticated measurements for one metric
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: {type: string}
+        - name: tag
+          in: query
+          description: Optional repeatable tag filters in key:value form
+          schema:
+            type: array
+            items: {type: string}
+          style: form
+          explode: true
+      responses:
+        '200':
+          description: Actuator metric measurements and available tags
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: Metric not found}
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Shared administrator API key configured by FANOUT_API_KEY; at least 32 characters
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    AfterSequence:
+      name: after
+      in: query
+      description: |
+        Exclusive sequence cursor. Pass the previous page's last sequence, not its UUID.
+        Results are live keyset pages, not a point-in-time snapshot. An empty page ends
+        traversal at the current moment; subsequent records may appear later.
+      schema: {type: integer, format: int64, minimum: 0, default: 0}
+    OptionalIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Global event-ingestion key; unique across this service's administrative principal
+      schema: {type: string, minLength: 1, maxLength: 128, pattern: '^[!-~]+$'}
+    RequiredIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Replay idempotency key, scoped to this subscription
+      schema: {type: string, minLength: 1, maxLength: 128, pattern: '^[!-~]+$'}
+  responses:
+    BadRequest:
+      description: Invalid JSON, parameter, rule, URL, key or replay range
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: Missing or invalid API key
+      headers:
+        WWW-Authenticate:
+          schema: {type: string, example: ApiKey}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: Referenced resource does not exist, or replay subscription is inactive
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: Idempotency key was already used with a different request
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    TooLarge:
+      description: Request body exceeds configured byte limit (default 1 MiB)
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    UnsupportedMediaType:
+      description: JSON is required and compressed request bodies are unsupported
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    InternalError:
+      description: Request failed; retry with the same idempotency key if acceptance is uncertain
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    EventRequest:
+      type: object
+      additionalProperties: false
+      required: [type, source, payload]
+      properties:
+        type: {type: string, minLength: 1, maxLength: 128, pattern: '\S', example: order.created}
+        source: {type: string, minLength: 1, maxLength: 128, pattern: '\S', example: checkout}
+        payload:
+          description: Any JSON value, including arrays, primitives and explicit null
+      example:
+        type: order.created
+        source: checkout
+        payload: {orderId: order-42, amount: 149.95, customer: {tier: premium}}
+    Event:
+      type: object
+      required: [id, sequence, type, source, payload, acceptedAt, fanoutCompleted]
+      properties:
+        id: {type: string, format: uuid}
+        sequence: {type: integer, format: int64, minimum: 1}
+        type: {type: string}
+        source: {type: string}
+        payload: {}
+        acceptedAt: {type: string, format: date-time}
+        fanoutCompleted: {type: boolean}
+    FilterRule:
+      type: object
+      additionalProperties: false
+      description: |
+        Type and source lists each use OR internally; lists and all payload conditions are
+        combined using AND. Missing, null or empty lists are wildcards. Missing or null filter
+        means match everything. Matching is case-sensitive and never executes user code.
+      properties:
+        eventTypes:
+          type: [array, 'null']
+          maxItems: 100
+          uniqueItems: true
+          items: {type: string, minLength: 1, maxLength: 200, pattern: '\S'}
+        sources:
+          type: [array, 'null']
+          maxItems: 100
+          uniqueItems: true
+          items: {type: string, minLength: 1, maxLength: 200, pattern: '\S'}
+        conditions:
+          type: [array, 'null']
+          maxItems: 20
+          items: {$ref: '#/components/schemas/PayloadCondition'}
+    PayloadCondition:
+      type: object
+      additionalProperties: false
+      required: [path, operator, value]
+      properties:
+        path:
+          type: string
+          maxLength: 512
+          description: RFC 6901 JSON pointer; empty string selects the root, ~0 escapes ~ and ~1 escapes /
+          example: /customer/tier
+        operator:
+          type: string
+          enum: [EQ, NE, EXISTS, IN, GT, GTE, LT, LTE]
+        value:
+          description: |
+            EQ and NE accept any JSON value. EXISTS requires a boolean. IN requires an array
+            of at most 100 values. GT/GTE/LT/LTE require numbers and only match numeric nodes.
+            EQ/NE/IN compare structures with decimal numeric equality, without string coercion.
+            Every operator except EXISTS returns false for a missing path, including NE.
+            Explicit null is a present value and differs from a missing path.
+    SubscriptionRequest:
+      type: object
+      additionalProperties: false
+      required: [webhookUrl, signingSecret]
+      properties:
+        webhookUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: HTTPS URL without embedded credentials or fragment; public destination required at delivery
+        filter:
+          oneOf:
+            - $ref: '#/components/schemas/FilterRule'
+            - type: 'null'
+        ordered:
+          type: boolean
+          default: false
+          description: Serialize attempts by source for this subscription; retries block later work until terminal
+        signingSecret:
+          type: string
+          minLength: 32
+          maxLength: 256
+          pattern: '\S'
+          writeOnly: true
+          description: Subscriber-provided HMAC-SHA256 key; use an unpredictable generated secret
+    Subscription:
+      type: object
+      required: [id, sequence, webhookUrl, filter, ordered, createdAt, deletedAt]
+      properties:
+        id: {type: string, format: uuid}
+        sequence: {type: integer, format: int64, minimum: 1}
+        webhookUrl: {type: string, format: uri}
+        filter: {$ref: '#/components/schemas/FilterRule'}
+        ordered: {type: boolean}
+        createdAt: {type: string, format: date-time}
+        deletedAt: {type: [string, 'null'], format: date-time}
+    ReplayRequest:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        from: {type: string, format: date-time, description: Inclusive acceptance timestamp}
+        to: {type: string, format: date-time, description: Exclusive timestamp, later than from and at most 31 days after it}
+    Replay:
+      type: object
+      required: [id, subscriptionId, from, to, deliveryCount, createdAt]
+      properties:
+        id: {type: string, format: uuid}
+        subscriptionId: {type: string, format: uuid}
+        from: {type: string, format: date-time}
+        to: {type: string, format: date-time}
+        deliveryCount: {type: integer, minimum: 0, maximum: 10000}
+        createdAt: {type: string, format: date-time}
+    Delivery:
+      type: object
+      required: [id, sequence, eventId, subscriptionId, replayId, source, eventSequence, queueSequence, status, attemptCount, nextAttemptAt, lastError, createdAt, updatedAt, deliveredAt]
+      properties:
+        id: {type: string, format: uuid, description: Stable subscriber deduplication key across retries}
+        sequence: {type: integer, format: int64, minimum: 1}
+        eventId: {type: string, format: uuid}
+        subscriptionId: {type: string, format: uuid}
+        replayId: {type: [string, 'null'], format: uuid}
+        source: {type: string}
+        eventSequence: {type: integer, format: int64}
+        queueSequence: {type: integer, format: int64, description: Acceptance order, or replay batch position}
+        status: {type: string, enum: [PENDING, DELIVERED, FAILED]}
+        attemptCount: {type: integer, minimum: 0}
+        nextAttemptAt: {type: string, format: date-time}
+        lastError: {type: [string, 'null']}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        deliveredAt: {type: [string, 'null'], format: date-time}
+    DeliveryAttempt:
+      type: object
+      required: [id, deliveryId, attemptNumber, startedAt, finishedAt, httpStatus, error, outcome]
+      properties:
+        id: {type: integer, format: int64, minimum: 1}
+        deliveryId: {type: string, format: uuid}
+        attemptNumber: {type: integer, minimum: 1}
+        startedAt: {type: string, format: date-time}
+        finishedAt: {type: [string, 'null'], format: date-time}
+        httpStatus: {type: [integer, 'null'], minimum: 100, maximum: 599}
+        error: {type: [string, 'null']}
+        outcome:
+          type: string
+          enum: [IN_PROGRESS, DELIVERED, RETRY, FAILED, UNKNOWN]
+          description: UNKNOWN means the worker lease expired and the remote side effect is uncertain
+    WebhookEvent:
+      type: object
+      description: |
+        Outbound JSON body. Verify X-Webhook-Signature as v1=hex(HMAC-SHA256(secret,
+        X-Webhook-Timestamp + '.' + exact UTF-8 request body)), check timestamp freshness,
+        and transactionally deduplicate deliveryId before applying the side effect.
+      required: [id, type, source, payload, acceptedAt, eventSequence, deliveryId, subscriptionId, replayId]
+      properties:
+        id: {type: string, format: uuid, description: Original event ID}
+        type: {type: string}
+        source: {type: string}
+        payload: {}
+        acceptedAt: {type: string, format: date-time}
+        eventSequence: {type: integer, format: int64}
+        deliveryId: {type: string, format: uuid}
+        subscriptionId: {type: string, format: uuid}
+        replayId: {type: [string, 'null'], format: uuid}
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: {type: string, format: uri-reference, example: 'about:blank'}
+        title: {type: string}
+        status: {type: integer, minimum: 400, maximum: 599}
+        detail: {type: string}
+        instance: {type: string, format: uri-reference}
+        requestId: {type: [string, 'null']}
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, example: UP}

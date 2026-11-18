@@ -1,0 +1,72 @@
+# Template: replace placeholders and configure secrets before submitting this spec.
+# Existing managed databases and the Kafka topic must already exist.
+name: notification-fanout
+region: blr
+ingress:
+  rules:
+    - component:
+        name: api
+      match:
+        path:
+          prefix: /
+alerts:
+  - rule: DEPLOYMENT_FAILED
+services:
+  - name: api
+    github:
+      repo: REPLACE_GITHUB_OWNER/REPLACE_REPOSITORY
+      branch: main
+      deploy_on_push: false
+    source_dir: /
+    dockerfile_path: Dockerfile
+    http_port: 8080
+    instance_size_slug: apps-s-1vcpu-1gb
+    instance_count: 2
+    health_check:
+      http_path: /actuator/health/readiness
+      initial_delay_seconds: 30
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 6
+      success_threshold: 1
+    termination:
+      grace_period_seconds: 45
+    envs:
+      - key: SPRING_PROFILES_ACTIVE
+        value: cloud
+        scope: RUN_TIME
+      - key: FANOUT_API_KEY
+        value: REPLACE_RANDOM_32_PLUS_CHARACTER_SECRET
+        type: SECRET
+        scope: RUN_TIME
+      - key: DB_URL
+        value: jdbc:postgresql://REPLACE_PG_HOST:25060/fanout?sslmode=verify-full&sslrootcert=/tmp/postgres-ca.crt
+        scope: RUN_TIME
+      - key: DB_USERNAME
+        value: fanout
+        scope: RUN_TIME
+      - key: DB_PASSWORD
+        value: REPLACE_DATABASE_PASSWORD
+        type: SECRET
+        scope: RUN_TIME
+      - key: POSTGRES_CA_CERT
+        value: REPLACE_WITH_MULTILINE_POSTGRES_PEM_CA_CERTIFICATE
+        type: SECRET
+        scope: RUN_TIME
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        value: REPLACE_KAFKA_SASL_HOST_AND_PORT
+        scope: RUN_TIME
+      - key: KAFKA_SASL_JAAS_CONFIG
+        value: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="REPLACE_KAFKA_USER" password="REPLACE_KAFKA_PASSWORD";'
+        type: SECRET
+        scope: RUN_TIME
+      - key: KAFKA_CA_CERT
+        value: REPLACE_WITH_MULTILINE_KAFKA_PEM_CA_CERTIFICATE
+        type: SECRET
+        scope: RUN_TIME
+      - key: FANOUT_DELIVERY_ALLOW_HTTP
+        value: "false"
+        scope: RUN_TIME
+      - key: FANOUT_DELIVERY_ALLOW_PRIVATE_ADDRESSES
+        value: "false"
+        scope: RUN_TIME
