@@ -46,6 +46,8 @@ Register a real HTTPS webhook, ingest an event using a unique idempotency key, a
 
 If readiness passes but events remain unprocessed, check Kafka topic existence, SASL port/credentials, certificate chain, permissions, consumer lag, and outbox backlog. Readiness checks the database; Kafka outages are deliberately buffered by the outbox and need their own alerts.
 
+If deployment fails before Java starts with `/app/entrypoint.sh: permission denied`, set the web service's Run Command to `/bin/sh /app/entrypoint.sh` and redeploy. This runs the existing certificate setup before starting Java. The Dockerfile explicitly sets script permissions and invokes `/bin/sh`; publish that Dockerfile to the connected GitHub branch and rebuild for the permanent image fix. The local workspace alone does not update App Platform's GitHub source. After deploying the fixed image, the Run Command override can be cleared. A generic “Container Terminated” banner alone does not establish an out-of-memory failure; use the detailed deployment logs.
+
 ## GitHub deployment workflow
 
 The push/PR workflow runs unit and real-container integration tests and builds the Docker image. To enable manual deployment:
