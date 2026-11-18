@@ -1,0 +1,317 @@
+{
+  "info": {
+    "_postman_id": "ab3da30b-fa51-40e3-92de-e0311a2b8c2d",
+    "name": "Notification-Fanout-API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "2566542"
+  },
+  "item": [
+    {
+      "name": "health-check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/actuator/health/readiness",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "actuator",
+            "health",
+            "readiness"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "subscriptions",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{apiKey}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n  \"webhookUrl\": \"{{webhookUrl}}\",\r\n  \"signingSecret\": \"{{signingSecret}}\",\r\n  \"ordered\": true,\r\n  \"filter\": {\r\n    \"eventTypes\": [\"order.created\"],\r\n    \"sources\": [\"checkout\"],\r\n    \"conditions\": [\r\n      {\r\n        \"path\": \"/total\",\r\n        \"operator\": \"GTE\",\r\n        \"value\": 100\r\n      }\r\n    ]\r\n  }\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/subscriptions",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "subscriptions"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "events",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{apiKey}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "cloud-demo-001"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n  \"type\": \"order.created\",\r\n  \"source\": \"checkout\",\r\n  \"payload\": {\r\n    \"orderId\": \"DO-001\",\r\n    \"total\": 150\r\n  }\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/events",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "events"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "delivery",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{apiKey}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/deliveries?eventId={{eventId}}&subscriptionId={{subscriptionId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "deliveries"
+          ],
+          "query": [
+            {
+              "key": "eventId",
+              "value": "{{eventId}}"
+            },
+            {
+              "key": "subscriptionId",
+              "value": "{{subscriptionId}}"
+            }
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "events",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{apiKey}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "cloud-demo-001"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n  \"type\": \"order.created\",\r\n  \"source\": \"checkout\",\r\n  \"payload\": {\r\n    \"orderId\": \"DO-001\",\r\n    \"total\": 150\r\n  }\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/events/{{eventId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "events",
+            "{{eventId}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "delivery",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{apiKey}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "cloud-demo-001"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/deliveries?eventId={{eventId}}&subscriptionId={{subscriptionId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "deliveries"
+          ],
+          "query": [
+            {
+              "key": "eventId",
+              "value": "{{eventId}}"
+            },
+            {
+              "key": "subscriptionId",
+              "value": "{{subscriptionId}}"
+            }
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "attempts",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{apiKey}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/deliveries/{{deliveryId}}/attempts",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "deliveries",
+            "{{deliveryId}}",
+            "attempts"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "replay",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Idempotency-Key",
+            "value": "cloud-demo-001"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{apiKey}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n  \"from\": \"2026-11-18T00:00:00Z\",\r\n  \"to\": \"2026-11-19T00:00:00Z\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/subscriptions/{{subscriptionId}}/replays",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "subscriptions",
+            "{{subscriptionId}}",
+            "replays"
+          ]
+        }
+      },
+      "response": []
+    }
+  ]
+}
