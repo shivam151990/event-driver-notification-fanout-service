@@ -2,11 +2,20 @@
 
 A Java 21 service that accepts JSON events, snapshots active subscriptions, routes events through Kafka, and sends signed webhook notifications. PostgreSQL is the source of truth for events, the transactional outbox, delivery state, and attempt history. Kafka is the asynchronous fanout backbone.
 
-Implemented extensions: Kafka integration, opt-in per-source delivery ordering, an idempotent time-range replay API, and DigitalOcean deployment configuration. **No cloud resources have been provisioned or deployed by this repository.**
+Implemented extensions: managed Kafka integration, opt-in per-source delivery ordering, an idempotent time-range replay API, and DigitalOcean App Platform deployment configuration.
+
+| Start here | What it contains |
+|---|---|
+| [Postman collection](postman/Notification-Fanout-API.postman_collection.json) and [environment](postman/notification-fanout.postman_environment.json.json) | Importable requests and connection variables; follow [Test with Postman](#test-with-postman) below |
+| [DigitalOcean testing guide](docs/DigitalOcean-testing-guide.md) | Step-by-step cloud checks, expected responses, failure scenarios, and assignment evidence |
+| [DigitalOcean deployment guide](deploy/digitalocean/README.md) | Managed PostgreSQL/Kafka setup, runtime variables, networking, troubleshooting, and deployment workflow |
+| [OpenAPI specification](docs/openapi.yaml) | Full API contract, also importable into Postman |
 
 ## Start locally
 
 Requirements: Docker with Compose. Running outside Docker also requires JDK 21+; the Maven wrapper downloads Maven automatically.
+
+**The complete application requires PostgreSQL and Kafka.** Compose creates both locally, so local testing needs no managed cloud clusters. There is no in-memory database/demo profile. App Platform builds the service's Dockerfile; it does not start the backing services in `compose.yaml`.
 
 ```sh
 cp .env.example .env
@@ -29,7 +38,64 @@ export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 ./mvnw spring-boot:run
 ```
 
+If you changed `DB_PASSWORD` in `.env`, use the same value in the Java process. The shell does not automatically load `.env`.
+
 The Compose defaults are for local development. Kafka is a single plaintext broker, and PostgreSQL has a development password. Production uses managed PostgreSQL and Kafka with verified TLS; see [DigitalOcean deployment](deploy/digitalocean/README.md).
+
+## Test with Postman
+
+### Import and configure
+
+1. In Postman, select **Import** and import both the [collection](postman/Notification-Fanout-API.postman_collection.json) and [environment JSON](postman/notification-fanout.postman_environment.json.json). The environment filename currently ends in `.json.json`; import that file as supplied.
+2. Select **digital-ocean-env** as the active environment. Duplicate it for local testing if needed.
+3. Set the variables below. The shared export retains the app URL, but credentials, the receiver URL, and generated IDs are intentionally empty. Supply credentials in your private Postman environment.
+
+| Variable | Where to get its value |
+|---|---|
+| `baseUrl` | DigitalOcean App Platform → your app → **Live App**, using its public HTTPS URL without a trailing `/`. For local Compose, use `http://localhost:8080`. Confirm the exported URL is the deployment you intend to test. |
+| `apiKey` | The exact `FANOUT_API_KEY` configured on the running app. This is the service's administrator key, not a DigitalOcean access token, PostgreSQL password, or Kafka password. |
+| `signingSecret` | A separate random secret of at least 32 characters, supplied when creating the subscription. Generate it with `openssl rand -hex 32`; your receiver uses it to verify signatures. |
+| `webhookUrl` | A reachable public HTTPS receiver. For a smoke test, use **Your unique URL** from [Webhook.site](https://webhook.site/), not its dashboard URL, and send fictional data. |
+| `subscriptionId` | Leave blank initially; copy `id` from the successful **POST subscription** response. |
+| `eventId` | Leave blank initially; copy `id` from the successful **POST event** response. |
+| `deliveryId` | Leave blank initially; copy the matching delivery object's `id` from the **GET deliveries** response array. |
+
+`FANOUT_API_KEY` is configured on the server; Postman's `apiKey` only supplies that existing value. To create a new server key, generate at least 32 random characters, update the app's runtime secret, deploy the change, and set the same value in Postman. Keep the webhook signing secret separate.
+
+API requests need `X-API-Key: {{apiKey}}`. For POST requests, select **Body → raw → JSON** and ensure `Content-Type: application/json` is present. Enter variable values without surrounding quotes. JSON bodies and Kafka's JAAS configuration have their own quotation syntax; do not remove the quotes inside those formats.
+
+### Run the first end-to-end check
+
+The bundled collection is a **manual smoke-test collection** with a replay request. It does not contain test assertions or scripts that automatically save IDs or wait for asynchronous delivery. Use request methods and paths to distinguish similarly named entries.
+
+| Order | Request | Expected result / next action |
+|---|---|---|
+| 1 | `GET /actuator/health/readiness` (`health-check`) | `200` and `{"status":"UP"}`; no API key required |
+| 2 | `POST /api/v1/subscriptions` (`subscriptions`) | `201`; save response `id` as `subscriptionId` |
+| 3 | `POST /api/v1/events` (`events`) | `202`; save response `id` as `eventId` |
+| 4 | `GET /api/v1/events/{{eventId}}` (`events`) | Eventually `fanoutCompleted: true` |
+| 5 | `GET /api/v1/deliveries?eventId={{eventId}}&subscriptionId={{subscriptionId}}` (`delivery`) | Poll until the matching row exists; save its `id` as `deliveryId`, then verify `status: "DELIVERED"` |
+| 6 | `GET /api/v1/deliveries/{{deliveryId}}/attempts` (`attempts`) | Check attempt timestamps, outcome, and a `2xx` `httpStatus`; confirm the same delivery arrived at the receiver |
+
+Create the subscription **before** submitting the event. The sample subscription matches `order.created` from `checkout` with `payload.total >= 100`; the sample event uses `150`. Use a fresh `Idempotency-Key` for each new event/test run, replacing the collection's `cloud-demo-001`. Reusing an old key returns the original event, whose subscription snapshot may predate your new subscription. Reuse a key deliberately only when checking idempotency.
+
+A readiness response verifies the process and database, not the complete Kafka/webhook path. `202` means durable acceptance; `fanoutCompleted` means matching finished. Confirm both `DELIVERED` and receiver receipt to complete the smoke test. Delivery lists can briefly be empty while matching runs.
+
+For `replay`, update the example UTC dates to cover your events' `acceptedAt` timestamps, and choose a separate key such as `cloud-replay-001`. The original event ID is preserved; each replay delivery has a new delivery ID and a `replayId`.
+
+Follow the [DigitalOcean testing guide](docs/DigitalOcean-testing-guide.md) for authentication failures, filtering, duplicate/conflicting ingestion, multiple subscribers, retry/recovery, terminal failure, ordering, replay, restart persistence, and deletion. It includes additional requests and receiver changes beyond the bundled collection. Save webhook/audit evidence and a green GitHub Actions run for the assignment.
+
+### Common testing issues
+
+| Symptom | Check |
+|---|---|
+| `401 A valid X-API-Key header is required` | Select the environment, populate `apiKey` with the running app's `FANOUT_API_KEY`, and enable the `X-API-Key` header. A Bearer token does not replace this header. |
+| `415 Content-Type 'null' is not supported` | Use **Body → raw → JSON** and `Content-Type: application/json` for POST requests. |
+| `404` at the app's root URL | There is no homepage; use `/actuator/health/readiness` or an API path. For an ID-based API URL, check that the variable contains an ID returned by this deployment. |
+| Empty delivery array | Wait for fanout, check the filter and both IDs, and confirm the subscription existed before this event was accepted. Check Kafka connectivity if fanout never completes. |
+| `PENDING` or `FAILED` delivery | Inspect attempts and `lastError`; check receiver availability, HTTP response codes, scheduled retries, and earlier ordered work. |
+
+When sharing Postman files, export the collection and a sanitized environment copy. Keep real API keys and signing secrets out of exported JSON, saved examples, and Git. Clear receiver URLs and generated IDs for a fresh evaluator run; share any required test credential separately through an appropriate private channel.
 
 ## Architecture
 
@@ -223,7 +289,17 @@ curl -i "$API/api/v1/subscriptions/SUBSCRIPTION_UUID/replays" \
 
 Ranges are UTC instants with inclusive `from` and exclusive `to`, based on server acceptance time. A range may span at most 31 days and select at most 10,000 eligible events. Split larger recovery windows. Replay reevaluates the target subscription's immutable filter against retained events for which that subscription was present in the original ingestion snapshot. It does not expose events accepted before registration. The target must be active. Repeating the same key and range returns the existing replay; different content with the same key conflicts. Original audit history is preserved.
 
-## Tests and CI/CD
+## Deploy on DigitalOcean
+
+Follow the [deployment guide](deploy/digitalocean/README.md) for the complete UI steps, environment-variable table, and troubleshooting. The [App Platform spec](deploy/digitalocean/app.yaml) is a template: replace its placeholders before use.
+
+1. Provision managed PostgreSQL and Kafka in the intended region/VPC. Create the database/user and the Kafka topic `fanout.events.v1`; the application does not create Kafka topics.
+2. Connect the GitHub repository to App Platform using its Dockerfile, HTTP port `8080`, and readiness path `/actuator/health/readiness`.
+3. Set `SPRING_PROFILES_ACTIVE=cloud`, the database and Kafka connection variables/certificates, and a generated `FANOUT_API_KEY`. For private Kafka access, copy **both hostname and port from VPC network → SASL**; a private hostname with the public SASL port can fail when the client connects to the advertised brokers.
+4. Enable the app's VPC connection and authorize its outbound connection on **both** managed clusters. Size database pools for the total app instance count; public ingress IPs are not the app's outbound IPs.
+5. Deploy, inspect runtime logs, and run the [cloud testing guide](docs/DigitalOcean-testing-guide.md). A successful image build alone does not verify startup or end-to-end delivery.
+
+## Automated tests and CI/CD
 
 ```sh
 ./mvnw test        # Unit tests; does not require Docker
@@ -232,7 +308,16 @@ Ranges are UTC instants with inclusive `from` and exclusive `to`, based on serve
 
 Integration tests use **real PostgreSQL and Kafka** in Testcontainers and a local HTTP receiver. They must run rather than silently skip when Docker is missing. Unit tests cover filter semantics, URL policy, signature generation, and retry behavior. Integration tests exercise HTTP authentication and validation, concurrent idempotent ingestion, matching/nonmatching fanout, retries and audit history, terminal failure, deletion, replay, ordering, duplicate Kafka records, a paused-broker outage, transaction rollback on outbox failure, and lease recovery/fencing. See the test sources for executable scenarios and precise assertions.
 
-`.github/workflows/ci.yml` runs `verify` on pushes and pull requests, publishes test reports, and builds the deployment image. The manual DigitalOcean workflow reruns verification before deploying an existing App Platform app. It requires a `production` GitHub environment and its `DIGITALOCEAN_ACCESS_TOKEN` secret; details are in the deployment guide.
+| Workflow | Trigger | What it verifies or deploys |
+|---|---|---|
+| [Build and test](.github/workflows/ci.yml) | Every push, pull request, or manual run | JDK 21, `./mvnw -B -ntp verify`, uploaded test/coverage reports, then a Docker image build |
+| [Deploy to DigitalOcean](.github/workflows/deploy.yml) | Manual run on `main`, with an existing `app_id` | Reruns `verify`, then requests an App Platform rebuild/deployment and waits for completion |
+
+**CI runs in GitHub Actions, not in the DigitalOcean window.** Push the repository including `.github/workflows/ci.yml`, open **GitHub → Actions → Build and test**, and check the run for that commit. Testcontainers starts disposable PostgreSQL and Kafka on the GitHub runner; CI needs neither managed-cluster credentials nor a DigitalOcean token. Reports are attached as the `test-reports` artifact. The Postman collection and cloud guide are separate manual acceptance checks.
+
+To enable the deployment workflow, create the GitHub environment `production`, add its `DIGITALOCEAN_ACCESS_TOKEN` secret, and run **Deploy to DigitalOcean** with the App Platform app ID. Disable App Platform's automatic deploy-on-push when using this test-gated workflow; an independent automatic deployment does not wait for GitHub CI. The supplied app spec already disables it. See the [deployment workflow instructions](deploy/digitalocean/README.md#github-actions-ci-and-deployment).
+
+The deployment workflow rebuilds the app's configured remote `main` branch; it does not promote the image built by CI. Avoid concurrent pushes during deployment. Promoting an immutable tested image digest is a future hardening step.
 
 ## Operations
 

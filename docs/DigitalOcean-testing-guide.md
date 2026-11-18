@@ -2,25 +2,30 @@
 
 Test the complete path: **API → PostgreSQL → Kafka → matching → webhook → delivery audit**. A successful deployment or health check alone does not verify notification delivery.
 
-Use Postman against your live DigitalOcean HTTPS URL. Follow this sequence.
+Use Postman against your live DigitalOcean HTTPS URL. Follow this sequence. For provisioning, runtime variables, or connection failures, use the [deployment guide](../deploy/digitalocean/README.md).
 
 ## 1. Set up Postman variables
 
-Create an environment with:
+In Postman, select **Import** and import both files from the repository:
 
-| Variable         | Value                                                 |     |
-| ---------------- | ----------------------------------------------------- | --- |
-| `baseUrl`        | Your DigitalOcean app URL, without a trailing `/`     |     |
-| `apiKey`         | The app’s `FANOUT_API_KEY`                            |     |
-| `signingSecret`  | A separate generated secret of at least 32 characters |     |
-| `webhookUrl`     | Set in step 3                                         |     |
-| `subscriptionId` | Set after creating a subscription                     |     |
-| `eventId`        | Set after accepting an event                          |     |
-| `deliveryId`     | Set after querying deliveries                         |     |
+- [Notification-Fanout-API.postman_collection.json](../postman/Notification-Fanout-API.postman_collection.json)
+- [notification-fanout.postman_environment.json.json](../postman/notification-fanout.postman_environment.json.json)
 
-Select this environment in Postman before sending requests.
+Select **digital-ocean-env** as the active environment, then fill in its variables. The shared export intentionally leaves credentials, the receiver URL, and generated IDs empty.
 
-You can import the project’s [OpenAPI specification](openapi.yaml) into Postman to generate the requests. See the [Postman import instructions](https://learning.postman.com/docs/getting-started/importing-and-exporting/importing-data).
+| Variable | Value |
+|---|---|
+| `baseUrl` | Your DigitalOcean app's **Live App** HTTPS URL, without a trailing `/`; confirm the exported URL still points to your deployment |
+| `apiKey` | The exact `FANOUT_API_KEY` set in the running app's runtime environment, not a DigitalOcean access token |
+| `signingSecret` | A separate generated secret of at least 32 characters, for example the output of `openssl rand -hex 32` |
+| `webhookUrl` | Set in step 3 |
+| `subscriptionId` | Leave blank until step 4; copy the subscription response's `id` |
+| `eventId` | Leave blank until step 5; copy the event response's `id` |
+| `deliveryId` | Leave blank until step 6; copy the matching delivery object's `id` |
+
+These IDs are returned by the API, not by DigitalOcean's console. The collection has no assertions, polling scripts, or automatic variable capture: save IDs manually and repeat GET requests as described below. It contains the smoke-test and replay requests; add or adapt requests for the additional scenarios in this guide. Follow the methods and URLs below, since some collection entries have the same name.
+
+Alternatively, import the project's [OpenAPI specification](openapi.yaml) to generate requests for the full API. See the [Postman import instructions](https://learning.postman.com/docs/getting-started/importing-and-exporting/importing-data).
 
 For all `/api/v1/...` requests, add:
 
@@ -29,6 +34,8 @@ X-API-Key: {{apiKey}}
 ```
 
 For POST requests, select **Body → raw → JSON**, which sets `Content-Type: application/json`.
+
+For GET requests, use **Body → none**; they do not need an `Idempotency-Key`. If a request fails with `401`, check the selected environment, API key value, and enabled header. If a POST fails with `415`, check its JSON body mode and `Content-Type`. See also [Postman setup and troubleshooting](../README.md#test-with-postman).
 
 ## 2. Check health and authentication
 
@@ -116,6 +123,8 @@ Add this header:
 Idempotency-Key: cloud-demo-001
 ```
 
+Use a fresh key for a new test run. Reusing an existing key returns the original event, which may have been accepted before the subscription you just created.
+
 Body:
 
 ```json
@@ -159,7 +168,7 @@ Query the delivery:
 GET {{baseUrl}}/api/v1/deliveries?eventId={{eventId}}&subscriptionId={{subscriptionId}}
 ```
 
-Wait for **`status: "DELIVERED"`**, then save its `id` as `deliveryId`.
+The result is an array and may initially be empty while fanout runs. Once the matching object appears, save **that object's** `id` as `deliveryId` and poll until **`status: "DELIVERED"`**. The subscription ID and event ID are different identifiers; do not use either in place of the delivery ID.
 
 Query its attempts:
 
@@ -254,7 +263,7 @@ Example body covering 18 November 2026 in UTC:
 }
 ```
 
-If testing on another date, adjust the range to include your events’ `acceptedAt` timestamps. The range is inclusive of `from` and exclusive of `to`.
+If testing on another date, adjust the range to include your events' `acceptedAt` timestamps. The range is inclusive of `from` and exclusive of `to`, and may span at most 31 days and select at most 10,000 eligible events. Update the bundled replay request's example key to `cloud-replay-001` (or a fresh replay key for this run). Reusing a replay key with a different range returns `409`; the same key and range returns the original replay.
 
 Expected: **202 Accepted**, with `deliveryCount` greater than zero if eligible events exist.
 
@@ -296,3 +305,5 @@ LOGGING_LEVEL_ORG_APACHE_KAFKA_CLIENTS
 ```
 
 The automated suite in GitHub and these live cloud checks together provide useful assignment evidence.
+
+Export the collection and a sanitized environment for the reviewer. Keep `baseUrl`, clear `apiKey`, `signingSecret`, `webhookUrl`, and generated IDs, and inspect exported files and saved response examples before sharing. The reviewer should fill in a private test credential and their own receiver URL, then generate fresh IDs by following this guide. Do not attach DigitalOcean tokens or database/Kafka passwords.
