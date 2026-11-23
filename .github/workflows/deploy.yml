@@ -1,11 +1,17 @@
 name: Deploy to DigitalOcean
 
 on:
+  # Continuous deployment: runs after "Build and test" finishes on a push to main.
+  workflow_run:
+    workflows: ["Build and test"]
+    types: [completed]
+    branches: [main]
+  # Manual deployment from the Actions tab.
   workflow_dispatch:
     inputs:
       app_id:
-        description: Existing DigitalOcean App Platform app ID
-        required: true
+        description: DigitalOcean App Platform app ID (defaults to the DO_APP_ID repository variable)
+        required: false
         type: string
 
 permissions:
@@ -17,23 +23,38 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main'
+    # Auto: only when CI succeeded for a push to main. Manual: only from main.
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_branch == 'main')
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     environment: production
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # CI has already run verify for automatic deploys; re-run it only for manual ones.
       - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_dispatch'
       - uses: actions/setup-java@v4
+        if: github.event_name == 'workflow_dispatch'
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
       - name: Verify before deployment
+        if: github.event_name == 'workflow_dispatch'
         run: sh ./mvnw -B -ntp verify
       - uses: digitalocean/action-doctl@v2
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
       - name: Rebuild and deploy configured main branch
         env:
-          APP_ID: ${{ inputs.app_id }}
-        run: doctl apps create-deployment "$APP_ID" --force-rebuild --wait
+          APP_ID: ${{ inputs.app_id || vars.DO_APP_ID }}
+        run: |
+          if [ -z "$APP_ID" ]; then
+            echo "::error::No app ID. Set the DO_APP_ID repository variable or pass app_id."
+            exit 1
+          fi
+          doctl apps create-deployment "$APP_ID" --force-rebuild --wait

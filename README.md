@@ -99,43 +99,145 @@ When sharing Postman files, export the collection and a sanitized environment co
 
 ## Architecture
 
+PostgreSQL is the source of truth. Every stage reads rows left by the previous stage, does one job, and writes its result back. No stage calls another directly, so any stage can crash and resume from committed state. Kafka carries only event IDs, as a durable trigger between ingestion and matching.
+
+### 1. Overview: what you call, what runs on its own, what you read
+
 ```mermaid
-flowchart TD
-    P[Producer] -->|POST event + optional Idempotency-Key| API[REST API: authentication and validation]
-    S[Subscriber administrator] -->|Create / list / delete| API
-    API -->|One transaction: event + active subscription snapshot + outbox| DB[(PostgreSQL)]
-    DB -->|Commit succeeds| ACK[202 Accepted]
-    DB --> RELAY[Outbox relay: database lock + acknowledged publish]
-    RELAY -->|Event ID keyed by source| K[(Kafka topic)]
-    K --> MATCH[Consumer: load event + snapshot, evaluate filters]
-    MATCH -->|Transaction: deduplicated delivery rows + fanout completion| DB
-    MATCH -->|Commit then acknowledge offset| K
-    DB --> WORKER[Delivery workers: claim due rows with leases]
-    WORKER --> ORDER{Ordered subscription?}
-    ORDER -->|Earlier source work pending| WAIT[Leave pending]
-    WAIT --> DB
-    ORDER -->|Ready| HTTP[Validate and pin destination; sign request; send HTTP]
-    HTTP --> WEBHOOK[Subscriber webhook]
-    WEBHOOK --> RESULT{Result}
-    RESULT -->|2xx| DONE[Delivered]
-    RESULT -->|Transient failure and attempts remain| BACKOFF[Exponential backoff + jitter]
-    RESULT -->|Permanent failure or exhausted| FAILED[Failed]
-    BACKOFF --> DB
-    DONE --> DB
-    FAILED --> DB
-    HTTP -->|Attempt start, completion, HTTP status or error| AUDIT[(Attempt audit in PostgreSQL)]
-    AUDIT --> QUERY[GET delivery / attempts / event history]
-    DB --> QUERY
-    REPLAY[POST subscriber replay with time range] -->|Transaction: replay ID + new delivery work| DB
+flowchart TB
+    subgraph CALL["You call: write APIs"]
+        direction LR
+        SUB["POST /subscriptions<br/>DELETE /subscriptions/{id}"] ~~~ EVT["POST /events"] ~~~ REP["POST /subscriptions/{id}/replays"]
+    end
+    DB[("PostgreSQL<br/>source of truth")]
+    subgraph BG["Background: no API, timers and listeners"]
+        direction LR
+        RELAY["Outbox relay<br/>every 500 ms"] --> KAFKA[("Kafka<br/>event IDs only")] --> CONS["Consumer<br/>runs filters"]
+        WORK["Delivery workers<br/>every 250 ms"]
+    end
+    HOOK["Subscriber webhook"]
+    subgraph READ["You observe: read APIs"]
+        direction LR
+        GE["GET /events/{id}"] ~~~ GD["GET /deliveries<br/>GET /deliveries/{id}"] ~~~ GA["GET /deliveries/{id}/attempts"]
+    end
+    CALL -->|"commit, then respond"| DB
+    DB <-->|"read work, write results"| BG
+    WORK -->|"signed HTTP POST"| HOOK
+    DB --> READ
 ```
 
-1. Ingestion commits an event, a snapshot of currently active subscription IDs, and an outbox row together. A successful `202` is returned only after commit. A database failure is an error, never a successful acceptance.
-2. The relay publishes the event ID to Kafka with acknowledged writes. It marks the outbox row published only after Kafka confirms. A crash in between can publish a duplicate.
-3. The Kafka consumer evaluates immutable filters from the ingestion snapshot. A transaction inserts delivery work and records fanout completion. Redelivery of a Kafka record cannot create another original delivery for the same event/subscription pair. The relay also republishes acknowledged events still awaiting fanout after five minutes, recovering from broker retention expiry or lost Kafka records using PostgreSQL.
-4. Delivery workers claim due work using database leases. HTTP takes place outside a database transaction. Audit rows record attempts, including interrupted attempts whose outcome cannot be known after a crash.
-5. Failed transient requests are scheduled in PostgreSQL. Retrying does not sleep in a Kafka consumer or depend on an in-memory timer surviving a restart.
+Replay writes delivery rows straight to PostgreSQL. It does not go through the outbox or Kafka; the delivery workers pick replayed work up like any other.
 
-Subscription deletion is a soft delete: it prevents membership in future ingestion snapshots and new replays. Already accepted events retain their subscription snapshot and delivery work. It does not retract HTTP requests or erase audit history.
+### 2. Ingestion: what each write API commits
+
+```mermaid
+flowchart LR
+    P["Producer"] -->|"POST /events<br/>optional Idempotency-Key"| GATE["Request filter and validation<br/>X-API-Key, 1 MiB limit,<br/>strict JSON, field rules"]
+    GATE --> LOCK["Global acceptance lock<br/>serialises events with<br/>subscribe, delete, replay"]
+    LOCK --> IDEM{"Idempotency-Key<br/>seen before?"}
+    IDEM -->|"same body"| SAME["Return original event"]
+    IDEM -->|"different body"| CONFLICT["409 Conflict"]
+    IDEM -->|"new or absent"| TX
+    subgraph TX["One PostgreSQL transaction"]
+        direction TB
+        E["events: the fact<br/>fanout_completed = false"]
+        ES["event_subscriptions: every active<br/>subscription ID, no filtering"]
+        O["outbox: still to send to Kafka"]
+    end
+    TX -->|"commit"| ACK["202 Accepted"]
+```
+
+| API | Lock | Rows written | Response |
+|---|---|---|---|
+| `POST /subscriptions` | Global | 1 row in `subscriptions`. The filter is validated and stored, not evaluated. | `201` |
+| `POST /events` | Global | `events` + one `event_subscriptions` row per active subscription + `outbox` | `202` |
+| `DELETE /subscriptions/{id}` | Global | Sets `subscriptions.deleted_at` (soft delete) | `204` |
+| `POST /subscriptions/{id}/replays` | Global | `replays` + new `deliveries` rows (see section 5) | `202` |
+
+- `202` is returned only after the commit. A database failure is an error response, never a false acceptance.
+- **Why the snapshot:** filters run later, asynchronously, and subscriptions can be created or deleted in the meantime. `event_subscriptions` freezes who was listening when the event was accepted. Filters are immutable, so evaluating them later gives the same answer as evaluating them now.
+- **Why the global lock:** without it, a subscription committed just before an event could be missing from that event's snapshot, or one deleted just before could still be included. Serialising these operations gives every event a clean before-or-after relationship with every subscription change. The cost is that acceptance is serialised.
+- **Why an outbox:** the event and the instruction to publish it commit together, so a crash cannot leave an accepted event that Kafka never hears about, and Kafka downtime does not block ingestion.
+
+### 3. Fanout: outbox relay, Kafka, and the consumer
+
+```mermaid
+sequenceDiagram
+    participant DB as PostgreSQL
+    participant R as Outbox relay
+    participant K as Kafka
+    participant C as Consumer
+    loop every 500 ms, one relay at a time (relay lock)
+        R->>DB: reset rows published over 5 min ago but not fanned out
+        R->>DB: read up to 50 unsent outbox rows, oldest first
+        R->>K: send event ID, key = source
+        K-->>R: acknowledged (acks=all)
+        R->>DB: set outbox.published_at
+    end
+    K->>C: event ID
+    C->>DB: BEGIN, lock event row, stop if fanout_completed
+    C->>DB: read snapshot subscriptions and filters, run FilterMatcher
+    C->>DB: INSERT deliveries for matches (PENDING), set fanout_completed, COMMIT
+    C-->>K: commit offset, only after the database commit
+```
+
+- A crash after Kafka acknowledges but before `published_at` is set publishes the event again. The consumer ignores it because `fanout_completed` is already true, and the unique key `(event_id, subscription_id, generation)` prevents a duplicate delivery row.
+- A crash in the consumer rolls back its transaction, so Kafka redelivers the message.
+- The 5-minute reset recovers events whose Kafka message was lost or expired, using PostgreSQL as the record.
+- Keying by source keeps each source's events on one partition, in order.
+
+### 4. Delivery: claim, send, retry
+
+```mermaid
+flowchart TD;
+    POLL["Worker polls every 250 ms, up to 8 in parallel"];
+    FIND{"Due PENDING delivery, not leased?<br/>Ordered: earlier work for same source pending?"};
+    CLAIM["Claim in short transaction<br/>FOR UPDATE SKIP LOCKED, 60 s lease,<br/>attempt_count + 1, attempt IN_PROGRESS"];
+    SEND["Send with no transaction open<br/>pinned DNS, private IPs blocked,<br/>HMAC-SHA256 signature, 10 s timeout, no redirects"];
+    RES{"Result, saved only if lease still held"};
+    OK["DELIVERED"];
+    RETRY["Stays PENDING<br/>next_attempt_at: 1 s doubling to 5 min,<br/>jitter, honours Retry-After"];
+    FAIL["FAILED"];
+    CRASH["Worker crash or lease expiry mid-call"];
+    POLL --> FIND;
+    FIND -->|"earlier work pending: skip"| POLL;
+    FIND -->|"ready"| CLAIM;
+    CLAIM --> SEND;
+    SEND --> RES;
+    RES -->|"2xx"| OK;
+    RES -->|"other status, timeout, network error, attempts left"| RETRY;
+    RES -->|"8 attempts used, or URL blocked by policy"| FAIL;
+    RETRY -.->|"when due"| POLL;
+    CRASH -.->|"next claim marks attempt UNKNOWN, retries, possible duplicate"| CLAIM;
+```
+
+- No database transaction is held during HTTP, so slow webhooks do not hold locks.
+- Retries are timestamps in PostgreSQL, not sleeping threads, so they survive restarts and any replica can perform them.
+- 4xx responses are retried like 5xx. Only an outbound-policy rejection fails immediately.
+- Every attempt is written to `delivery_attempts` with start and finish times, HTTP status or error, and outcome (`IN_PROGRESS`, `DELIVERED`, `RETRY`, `FAILED`, `UNKNOWN`).
+
+### 5. Observe, replay, and delete
+
+| API | Reads | Use it to answer |
+|---|---|---|
+| `GET /events/{id}` | `events` | Has matching run yet? (`fanoutCompleted`) |
+| `GET /deliveries?eventId=&subscriptionId=` | `deliveries` | Who matched, and what is each delivery's status? |
+| `GET /deliveries/{id}` | `deliveries` | Current status of one delivery |
+| `GET /deliveries/{id}/attempts` | `delivery_attempts` | The full try-by-try audit |
+| `GET /subscriptions`, `GET /subscriptions/{id}` | `subscriptions` | Who is listening (the list hides deleted ones; by ID includes them) |
+
+```mermaid
+flowchart LR
+    RQ["POST /subscriptions/{id}/replays<br/>from, to, Idempotency-Key"] --> RL["Global lock, idempotency check,<br/>subscription must be active"]
+    RL --> RC["Events in range whose snapshot<br/>includes this subscription<br/>max 10,000"]
+    RC --> RF["Run the filter now"]
+    RF --> RD["New deliveries rows, PENDING<br/>generation = replay ID"]
+    RD --> RW["Delivery workers, as in section 4"]
+```
+
+- Replay re-sends matching events even if they were delivered before. Each replay delivery has a new delivery ID and a `replayId`.
+- For ordered subscriptions, replayed work queues behind all existing work.
+- Deleting a subscription removes it from future snapshots and blocks new replays. Already accepted events keep their snapshot and pending deliveries, which still run. Nothing is retracted and audit history is kept.
 
 ## REST API
 
