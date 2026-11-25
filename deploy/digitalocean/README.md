@@ -123,11 +123,15 @@ For Kafka network diagnosis, temporarily set `LOGGING_LEVEL_ORG_APACHE_KAFKA_CLI
 
 CI runs **on GitHub**, while App Platform builds and hosts the deployed service. [Build and test](../../.github/workflows/ci.yml) runs on every push and pull request, executes `sh ./mvnw -B -ntp verify` using temporary PostgreSQL/Kafka Testcontainers, uploads reports, and builds the Docker image. Both workflows invoke the wrapper through `sh` so an executable bit lost during upload/export does not prevent Maven from starting. CI does not require the managed clusters or DigitalOcean credentials.
 
-To enable the separate [manual deployment workflow](../../.github/workflows/deploy.yml):
+The [deployment workflow](../../.github/workflows/deploy.yml) runs **automatically** after **Build and test** succeeds for a push to `main`. Failed CI runs, pull requests, and other branches never deploy. To enable it:
 
 1. In GitHub, create an environment named `production`, configure any required reviewers, and add its `DIGITALOCEAN_ACCESS_TOKEN` secret with app deployment permissions.
-2. Point the App Platform app at this repository's `main` branch and disable automatic deployment, as in the supplied spec. Otherwise, a source push could deploy before GitHub tests pass.
-3. Open **GitHub → Actions → Deploy to DigitalOcean → Run workflow**, select `main`, and enter the existing app ID from DigitalOcean's app URL or `doctl apps list`. The ID is not the app's public URL. The workflow reruns verification and requests a rebuild/deployment, waiting for completion.
+2. Under **Settings → Secrets and variables → Actions → Variables**, add a repository variable `DO_APP_ID` with the existing app ID from DigitalOcean's app URL (`cloud.digitalocean.com/apps/<APP_ID>/…`) or `doctl apps list`. The ID is not the app's public URL. Add it as a variable, not a secret; the workflow reads `vars.DO_APP_ID`.
+3. Point the App Platform app at this repository's `main` branch and disable automatic deployment (**Settings → component → Source → Autodeploy**), as in the supplied spec. Otherwise, a source push could deploy before GitHub tests pass, and each push would deploy twice.
+
+After setup, push to `main` and watch **GitHub → Actions**: **Build and test** runs first, then **Deploy to DigitalOcean** requests a rebuild/deployment and waits for it to finish. Progress is also visible in the app's **Activity** tab in DigitalOcean.
+
+To deploy by hand, open **GitHub → Actions → Deploy to DigitalOcean → Run workflow** and select `main`. The optional `app_id` input overrides `DO_APP_ID`. Manual runs rerun verification before deploying; automatic runs skip it because CI has just passed.
 
 This workflow deploys the current remote `main` head, not an immutable image from the earlier test job. Avoid concurrent pushes during deployment. For immutable release promotion, publish a digest-pinned image to a registry and deploy that tested digest. The workflow does not provision clusters or configure runtime credentials; complete those in DigitalOcean first.
 

@@ -318,6 +318,57 @@ curl "$API/api/v1/deliveries/DELIVERY_UUID/attempts" \
 
 Delivery status is `PENDING`, `DELIVERED`, or `FAILED`. Pending work may be waiting for its scheduled retry time, another earlier event, or an active lease. The attempt history distinguishes these from successful delivery; a `202` ingestion response is not a webhook receipt.
 
+### Inspect events, deliveries, and subscriptions
+
+```sh
+# Event and fanout state; fanoutCompleted becomes true once filters have run
+curl "$API/api/v1/events/EVENT_UUID" \
+  -H "X-API-Key: $FANOUT_API_KEY"
+
+# One delivery: status, attemptCount, nextAttemptAt, lastError, deliveredAt
+curl "$API/api/v1/deliveries/DELIVERY_UUID" \
+  -H "X-API-Key: $FANOUT_API_KEY"
+
+# Active subscriptions, oldest first; pass the last item's sequence as `after` for the next page
+curl "$API/api/v1/subscriptions?limit=50&after=0" \
+  -H "X-API-Key: $FANOUT_API_KEY"
+
+# One subscription by ID, including a deleted one (deletedAt is then set)
+curl "$API/api/v1/subscriptions/SUBSCRIPTION_UUID" \
+  -H "X-API-Key: $FANOUT_API_KEY"
+```
+
+Example `GET /api/v1/events/{id}` response:
+
+```json
+{
+  "id": "6f1c…", "type": "order.created", "source": "checkout",
+  "acceptedAt": "2026-11-25T10:00:00.123456Z", "fanoutCompleted": true,
+  "sequence": 42, "payload": {"orderId": "1001", "total": 149.99}
+}
+```
+
+Subscription responses contain `id`, `webhookUrl`, `filter`, `ordered`, `createdAt`, `deletedAt`, and `sequence`. The `signingSecret` is never returned. Unknown IDs return `404`.
+
+### Delete a subscription
+
+```sh
+curl -i -X DELETE "$API/api/v1/subscriptions/SUBSCRIPTION_UUID" \
+  -H "X-API-Key: $FANOUT_API_KEY"
+```
+
+Returns `204 No Content`. This is a soft delete: the subscription stops appearing in the list and in snapshots for new events, and replays for it are rejected, but its history stays queryable. Deleting an already-deleted subscription also returns `204`; an unknown ID returns `404`. Deliveries that were already `PENDING` still run.
+
+### Health checks
+
+```sh
+curl -i "$API/actuator/health/readiness"   # 200 {"status":"UP"}; no API key needed
+curl -i "$API/actuator/health/liveness"    # process is running
+curl "$API/actuator/prometheus" -H "X-API-Key: $FANOUT_API_KEY"   # metrics; API key required
+```
+
+Readiness includes the database connection and is the path App Platform uses before routing traffic to a new instance. It does not check Kafka or webhook delivery; use the outbox and delivery metrics for those.
+
 ## Filter rule syntax
 
 All top-level constraints and payload conditions are combined with **AND**. Entries inside `eventTypes` or `sources` use **OR**. An omitted or empty type/source list matches all values. An empty filter matches every event in the subscription snapshot. Matching is case-sensitive; there are no wildcards, regular expressions, executable expressions, or implicit string-to-number conversions.
@@ -413,11 +464,11 @@ Integration tests use **real PostgreSQL and Kafka** in Testcontainers and a loca
 | Workflow | Trigger | What it verifies or deploys |
 |---|---|---|
 | [Build and test](.github/workflows/ci.yml) | Every push, pull request, or manual run | JDK 21, `sh ./mvnw -B -ntp verify`, uploaded test/coverage reports, then a Docker image build |
-| [Deploy to DigitalOcean](.github/workflows/deploy.yml) | Manual run on `main`, with an existing `app_id` | Reruns `verify`, then requests an App Platform rebuild/deployment and waits for completion |
+| [Deploy to DigitalOcean](.github/workflows/deploy.yml) | Automatically after **Build and test** succeeds for a push to `main`; also manual run on `main` | Requests an App Platform rebuild/deployment and waits for completion. Manual runs rerun `verify` first. |
 
 **CI runs in GitHub Actions, not in the DigitalOcean window.** Push the repository including `.github/workflows/ci.yml`, open **GitHub → Actions → Build and test**, and check the run for that commit. Testcontainers starts disposable PostgreSQL and Kafka on the GitHub runner; CI needs neither managed-cluster credentials nor a DigitalOcean token. Reports are attached as the `test-reports` artifact. The Postman collection and cloud guide are separate manual acceptance checks.
 
-To enable the deployment workflow, create the GitHub environment `production`, add its `DIGITALOCEAN_ACCESS_TOKEN` secret, and run **Deploy to DigitalOcean** with the App Platform app ID. Disable App Platform's automatic deploy-on-push when using this test-gated workflow; an independent automatic deployment does not wait for GitHub CI. The supplied app spec already disables it. See the [deployment workflow instructions](deploy/digitalocean/README.md#github-actions-ci-and-deployment).
+To enable the deployment workflow, create the GitHub environment `production`, add its `DIGITALOCEAN_ACCESS_TOKEN` secret, and add a repository variable `DO_APP_ID` containing the App Platform app ID. Every push to `main` that passes **Build and test** then deploys automatically. You can also run **Deploy to DigitalOcean** manually; its optional `app_id` input overrides `DO_APP_ID`. Disable App Platform's automatic deploy-on-push when using this test-gated workflow; an independent automatic deployment does not wait for GitHub CI. The supplied app spec already disables it. See the [deployment workflow instructions](deploy/digitalocean/README.md#github-actions-ci-and-deployment).
 
 If a run exits immediately with `./mvnw: Permission denied` (exit code `126`), Maven and the tests have not started: the wrapper's executable permission is missing. Both workflows invoke it with `sh ./mvnw` so they also work after file uploads/exports that lose permissions. For direct local execution, run `chmod +x mvnw`; in a Git checkout, record the executable bit with `git update-index --chmod=+x mvnw`. Push the updated workflow files to trigger a new run; rerunning an old failed commit does not pick up the fix.
 
